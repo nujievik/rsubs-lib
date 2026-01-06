@@ -8,10 +8,12 @@ use serde::Serialize;
 
 use std::fmt::Display;
 use std::str;
+use std::str::Lines;
 use time::format_description::BorrowedFormatItem;
 use time::macros::format_description;
 
 use crate::error;
+use crate::util::NPeekable;
 use time::Time;
 
 use super::ssa::SSA;
@@ -50,71 +52,84 @@ pub struct SRTLine {
 }
 
 impl SRT {
+    fn try_parse_block_header(
+        prev_seqnr: u32,
+        line_num: usize,
+        lines: &mut NPeekable<Lines>,
+    ) -> Result<(u32, Time, Time), SRTError> {
+        let seqnr_line = *lines.peek_n(0).ok_or_else(|| {
+            SRTError::new(SRTErrorKind::Parse("Unexpected EOF".to_string()), line_num)
+        })?;
+        let ts_line = *lines.peek_n(1).ok_or_else(|| {
+            SRTError::new(SRTErrorKind::Parse("Unexpected EOF".to_string()), line_num)
+        })?;
+
+        let seqnr: u32 = seqnr_line
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| SRTError::new(SRTErrorKind::Parse(e.to_string()), line_num))?;
+        if seqnr < prev_seqnr {
+            return Err(SRTError::new(
+                SRTErrorKind::Parse("Sequence number smaller than previous".to_string()),
+                line_num,
+            ));
+        }
+        let (start, end) = ts_line.trim().split_once("-->").ok_or(SRTError::new(
+            SRTErrorKind::Parse("invalid time range".to_string()),
+            line_num + 1,
+        ))?;
+        let start_time = Time::parse(start.trim(), TIME_FORMAT)
+            .map_err(|e| SRTError::new(SRTErrorKind::Parse(e.to_string()), line_num + 1))?;
+        let end_time = Time::parse(end.trim(), TIME_FORMAT)
+            .map_err(|e| SRTError::new(SRTErrorKind::Parse(e.to_string()), line_num + 1))?;
+
+        Ok((seqnr, start_time, end_time))
+    }
+
+    fn parse_block_message(
+        prev_seqnr: u32,
+        line_num: &mut usize,
+        lines: &mut NPeekable<Lines>,
+    ) -> String {
+        let mut msg_lines = vec![];
+        while let Some(line) = lines.next() {
+            if line.trim().is_empty() {
+                if Self::try_parse_block_header(prev_seqnr, *line_num, lines).is_ok() {
+                    break;
+                }
+            }
+            *line_num += 1;
+            msg_lines.push(line);
+        }
+        msg_lines.join("\n")
+    }
+
     /// Parses the given [String] into a [SRTFile].
     pub fn parse<S: AsRef<str>>(content: S) -> Result<SRT, SRTError> {
-        let mut line_num = 0;
-
-        let mut blocks = vec![vec![]];
-        for line in strip_bom(&content).lines() {
-            if line.trim().is_empty() {
-                if !blocks.last().unwrap().is_empty() {
-                    blocks.push(vec![])
-                }
-            } else {
-                blocks.last_mut().unwrap().push(line)
-            }
-        }
-        if blocks.last().is_some_and(|b| b.is_empty()) {
-            blocks.remove(blocks.len() - 1);
-        }
+        let content = content.as_ref();
+        let content = strip_bom(&content);
+        let mut iter = NPeekable::new(content.lines());
 
         let mut lines = vec![];
-        for block in blocks {
-            line_num += 1;
+        let mut line_num = 1;
+        let mut last_seqnr = 0;
 
-            let mut block_lines = block.into_iter();
-
-            // sequence number
-            let sequence_number = block_lines
-                .next()
-                .ok_or(SRTError::new(
-                    SRTErrorKind::Parse("invalid sequence number".to_string()),
-                    line_num,
-                ))?
-                .trim()
-                .parse::<u32>()
-                .map_err(|e| SRTError::new(SRTErrorKind::Parse(e.to_string()), line_num))?;
-            line_num += 1;
-            // start & end times
-            let (start, end) = {
-                let (start, end) = block_lines
-                    .next()
-                    .ok_or(SRTError::new(
-                        SRTErrorKind::Parse("invalid time range".to_string()),
-                        line_num,
-                    ))?
-                    .split_once("-->")
-                    .ok_or(SRTError::new(
-                        SRTErrorKind::Parse("invalid time range".to_string()),
-                        line_num,
-                    ))?;
-                let start_time = Time::parse(start.trim(), TIME_FORMAT)
-                    .map_err(|e| SRTError::new(SRTErrorKind::Parse(e.to_string()), line_num))?;
-                let end_time = Time::parse(end.trim(), TIME_FORMAT)
-                    .map_err(|e| SRTError::new(SRTErrorKind::Parse(e.to_string()), line_num))?;
-                (start_time, end_time)
-            };
-            line_num += 1;
-            line_num += block_lines.len();
-            // text
-            let text = block_lines.collect::<Vec<&str>>().join("\r\n");
-
+        while let Some(line) = iter.peek() {
+            if line.is_empty() {
+                line_num += 1;
+                iter.drop_n(1);
+                continue;
+            }
+            let hdr = Self::try_parse_block_header(last_seqnr, line_num, &mut iter)?;
+            iter.drop_n(2);
+            line_num += 2;
             lines.push(SRTLine {
-                sequence_number,
-                start,
-                end,
-                text,
-            })
+                sequence_number: hdr.0,
+                start: hdr.1,
+                end: hdr.2,
+                text: Self::parse_block_message(last_seqnr, &mut line_num, &mut iter),
+            });
+            last_seqnr = hdr.0;
         }
 
         Ok(SRT { lines })

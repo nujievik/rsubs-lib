@@ -178,9 +178,9 @@ from the American Museum of Natural History
 And with me is Neil deGrasse Tyson
 "#;
 
-    let err = SRT::parse(srt).unwrap_err();
-    assert_eq!(err.line(), 9);
-    assert!(matches!(err.kind(), SRTErrorKind::Parse(_)))
+    let res = SRT::parse(srt).unwrap();
+    assert_eq!(res.lines.len(), 3);
+    assert_eq!(res.lines[1].text, "We’re actually at the Lucern Hotel, just down the street\n\n00:00:16,000 --> 00:00:18,000\nfrom the American Museum of Natural History");
 }
 
 #[test]
@@ -223,4 +223,32 @@ fn parse_bom_content() {
     let bom = format!("\u{FEFF}{}", SIMPLE);
     let bom = SRT::parse(bom).unwrap();
     assert_eq!(bom, SRT::parse(SIMPLE).unwrap());
+}
+
+#[test]
+fn parse_empty_file() {
+    let srt = r#""#;
+    let res = SRT::parse(srt).unwrap();
+    assert_eq!(res.lines.len(), 0);
+}
+
+#[test]
+fn parse_message_with_empty_line() {
+    let srt = r#"1
+00:00:34,120 --> 00:00:37,680
+First line
+
+2
+00:00:39,440 --> 00:00:42,400
+First line
+Second line
+
+3
+
+3
+00:01:00,040 --> 00:01:02,840
+We are in New York City"#;
+    let res = SRT::parse(srt).unwrap();
+    assert_eq!(res.lines.len(), 3);
+    assert_eq!(res.lines[1].text, "First line\nSecond line\n\n3");
 }
